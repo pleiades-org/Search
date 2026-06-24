@@ -1,0 +1,11 @@
+# Rust
+target/
+
+# Local databases
+.codesearch-*.redb
+
+# Graphify
+graphify-out/
+.graphify-cache/
+.graphify/
+graphify.db

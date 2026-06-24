@@ -1,0 +1,34 @@
+[package]
+name = "codesearch"
+version = "0.1.0"
+edition = "2024"
+authors = ["Robert"]
+publish = false
+
+[lib]
+name = "codesearch"
+path = "src/lib.rs"
+
+[[bin]]
+name = "codesearch"
+path = "src/main.rs"
+
+[[bin]]
+name = "bench"
+path = "src/bin/bench.rs"
+
+[dependencies]
+ignore = "0.4"
+jwalk = "0.8"
+redb = "2"
+notify = { version = "6", default-features = false, features = ["macos_fsevent", "crossbeam-channel"] }
+rayon = "1"
+clap = { version = "4", features = ["derive"] }
+memchr = "2"
+
+[features]
+default = ["windows-mft"]
+windows-mft = ["dep:ntfs-core"]
+
+[target.'cfg(windows)'.dependencies]
+ntfs-core = { version = "0.8", optional = true }

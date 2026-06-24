@@ -1,0 +1,6 @@
+[graphify]
+root = "."
+output_dir = "graphify-out"
+code_only = true
+use_gitignore = true
+exclude = ["target", "graphify-out", ".codesearch-*.redb"]
