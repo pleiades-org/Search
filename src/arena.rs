@@ -1,11 +1,15 @@
-use crate::index::{file_name_from_path, name_len_chars, SearchIndex};
-use std::cmp::{max, min};
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use crate::index::{SearchIndex, name_len_chars};
+use std::{
+    collections::HashMap,
+    ffi::{OsStr, OsString},
+    path::PathBuf,
+};
 
 #[derive(Debug, Clone)]
 pub struct FileEntry {
+    /// Display path; filesystem operations use native_path to preserve non-Unicode names.
     pub path: String,
+    pub native_path: PathBuf,
     pub name_lower: String,
     pub name_len: u16,
 }
@@ -21,6 +25,20 @@ pub struct DirNode {
     pub file_count: u32,
 }
 
+impl DirNode {
+    fn empty(name: String, parent: Option<u32>) -> Self {
+        Self {
+            name,
+            parent,
+            child_dirs: Vec::new(),
+            file_ids: Vec::new(),
+            subtree_min_len: 0,
+            subtree_max_len: 0,
+            file_count: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct IndexArena {
     pub root: PathBuf,
@@ -34,23 +52,20 @@ impl IndexArena {
     pub fn empty(root: PathBuf) -> Self {
         Self {
             root,
-            dirs: vec![DirNode {
-                name: String::new(),
-                parent: None,
-                child_dirs: Vec::new(),
-                file_ids: Vec::new(),
-                subtree_min_len: u16::MAX,
-                subtree_max_len: 0,
-                file_count: 0,
-            }],
+            dirs: vec![DirNode::empty(String::new(), None)],
             files: Vec::new(),
             global_midpoint: 0,
-            search: SearchIndex::build_from_files(&[], 0),
+            search: SearchIndex::default(),
         }
     }
 
     pub fn from_paths(root: PathBuf, paths: Vec<PathBuf>) -> Self {
-        ArenaBuilder::new(root).with_paths(paths).finish()
+        let mut builder = ArenaBuilder::new(root);
+        for path in paths {
+            builder.add_path(path);
+        }
+        builder.arena.recompute_stats();
+        builder.arena
     }
 
     pub fn search_index(&self) -> &SearchIndex {
@@ -58,150 +73,146 @@ impl IndexArena {
     }
 
     pub fn recompute_stats(&mut self) {
-        for idx in (0..self.dirs.len()).rev() {
-            let (child_dirs, file_ids) = {
-                let dir = &self.dirs[idx];
-                (dir.child_dirs.clone(), dir.file_ids.clone())
-            };
-
-            let mut min_len = u16::MAX;
-            let mut max_len = 0u16;
-            let mut count = 0u32;
-
-            for &file_id in &file_ids {
-                let file = &self.files[file_id as usize];
-                min_len = min(min_len, file.name_len);
-                max_len = max(max_len, file.name_len);
-                count += 1;
-            }
-
-            for &child_id in &child_dirs {
-                let child = &self.dirs[child_id as usize];
-                min_len = min(min_len, child.subtree_min_len);
-                max_len = max(max_len, child.subtree_max_len);
-                count += child.file_count;
-            }
-
-            if count == 0 {
-                min_len = 0;
-            }
-
-            let dir = &mut self.dirs[idx];
-            dir.subtree_min_len = min_len;
-            dir.subtree_max_len = max_len;
-            dir.file_count = count;
+        for ordinal in (0..self.dirs.len()).rev() {
+            let (minimum, maximum, count) = self.directory_stats(ordinal);
+            let directory = &mut self.dirs[ordinal];
+            directory.subtree_min_len = minimum;
+            directory.subtree_max_len = maximum;
+            directory.file_count = count;
         }
-
-        let total: u64 = self.files.iter().map(|f| f.name_len as u64).sum();
+        let total: u64 = self.files.iter().map(|file| u64::from(file.name_len)).sum();
         self.global_midpoint = if self.files.is_empty() {
             0
         } else {
             (total / self.files.len() as u64) as u16
         };
-        let midpoint = self.global_midpoint;
-        self.search = SearchIndex::build_from_files(&self.files, midpoint);
+        self.search = SearchIndex::build_from_files(&self.files, self.global_midpoint);
+    }
+
+    fn directory_stats(&self, ordinal: usize) -> (u16, u16, u32) {
+        let directory = &self.dirs[ordinal];
+        let mut minimum = u16::MAX;
+        let mut maximum = 0;
+        let mut count = 0;
+        for &identifier in &directory.file_ids {
+            let file = &self.files[identifier as usize];
+            minimum = minimum.min(file.name_len);
+            maximum = maximum.max(file.name_len);
+            count += 1;
+        }
+        for &identifier in &directory.child_dirs {
+            let child = &self.dirs[identifier as usize];
+            if child.file_count == 0 {
+                continue;
+            }
+            minimum = minimum.min(child.subtree_min_len);
+            maximum = maximum.max(child.subtree_max_len);
+            count += child.file_count;
+        }
+        (if count == 0 { 0 } else { minimum }, maximum, count)
     }
 }
 
 struct ArenaBuilder {
     arena: IndexArena,
-    child_maps: Vec<HashMap<String, u32>>,
+    children: Vec<HashMap<OsString, u32>>,
 }
 
 impl ArenaBuilder {
     fn new(root: PathBuf) -> Self {
-        let arena = IndexArena::empty(root);
         Self {
-            child_maps: vec![HashMap::new()],
-            arena,
+            arena: IndexArena::empty(root),
+            children: vec![HashMap::new()],
         }
     }
 
-    fn with_paths(mut self, paths: Vec<PathBuf>) -> Self {
-        let root_str = self.arena.root.to_string_lossy().replace('\\', "/");
-        let root_prefix = if root_str.ends_with('/') {
-            root_str.clone()
-        } else {
-            format!("{root_str}/")
+    fn add_path(&mut self, path: PathBuf) {
+        let Ok(relative) = path.strip_prefix(&self.arena.root) else {
+            return;
         };
-
-        for path in paths {
-            let normalized = path.to_string_lossy().replace('\\', "/");
-            let rel = normalized
-                .strip_prefix(&root_prefix)
-                .or_else(|| {
-                    if normalized == root_str.trim_end_matches('/') {
-                        Some("")
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or(normalized.as_str());
-
-            if rel.is_empty() {
-                continue;
-            }
-
-            let name_lower = file_name_from_path(&path.to_string_lossy());
-            let name_len = name_len_chars(&name_lower);
-
-            let mut dir_id = 0u32;
-            let mut current = PathBuf::new();
-            for component in Path::new(rel).components() {
-                let part = component.as_os_str().to_string_lossy().into_owned();
-                current.push(&part);
-                let is_file = current.as_os_str().len() == Path::new(rel).as_os_len();
-
-                if is_file {
-                    let file_id = self.arena.files.len() as u32;
-                    self.arena.files.push(FileEntry {
-                        path: path.to_string_lossy().into_owned(),
-                        name_lower: name_lower.clone(),
-                        name_len,
-                    });
-                    self.arena.dirs[dir_id as usize].file_ids.push(file_id);
-                } else {
-                    dir_id = self.ensure_child_dir(dir_id, &part);
-                }
-            }
+        if relative
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        {
+            return;
         }
-
-        self
-    }
-
-    fn ensure_child_dir(&mut self, parent_id: u32, name: &str) -> u32 {
-        if let Some(&existing) = self.child_maps[parent_id as usize].get(name) {
-            return existing;
+        let parts: Vec<_> = relative
+            .components()
+            .filter_map(|part| match part {
+                std::path::Component::Normal(name) => Some(name.to_owned()),
+                _ => None,
+            })
+            .collect();
+        let Some((filename, directories)) = parts.split_last() else {
+            return;
+        };
+        let mut directory_id = 0;
+        for name in directories {
+            directory_id = self.ensure_directory(directory_id, name);
         }
-
-        let id = self.arena.dirs.len() as u32;
-        self.arena.dirs.push(DirNode {
-            name: name.to_owned(),
-            parent: Some(parent_id),
-            child_dirs: Vec::new(),
-            file_ids: Vec::new(),
-            subtree_min_len: u16::MAX,
-            subtree_max_len: 0,
-            file_count: 0,
+        let name_lower = filename.to_string_lossy().to_lowercase();
+        let name_len = name_len_chars(&name_lower);
+        let file_id =
+            u32::try_from(self.arena.files.len()).expect("file catalog exceeds 32-bit IDs");
+        self.arena.files.push(FileEntry {
+            path: path.to_string_lossy().into_owned(),
+            native_path: path,
+            name_lower,
+            name_len,
         });
-        self.child_maps.push(HashMap::new());
-        self.child_maps[parent_id as usize].insert(name.to_owned(), id);
-        self.arena.dirs[parent_id as usize].child_dirs.push(id);
-        id
+        self.arena.dirs[directory_id as usize]
+            .file_ids
+            .push(file_id);
     }
 
-    fn finish(mut self) -> IndexArena {
-        self.arena.recompute_stats();
-        self.arena
+    fn ensure_directory(&mut self, parent: u32, name: &OsStr) -> u32 {
+        if let Some(&identifier) = self.children[parent as usize].get(name) {
+            return identifier;
+        }
+        let identifier =
+            u32::try_from(self.arena.dirs.len()).expect("directory catalog exceeds 32-bit IDs");
+        self.arena.dirs.push(DirNode::empty(
+            name.to_string_lossy().into_owned(),
+            Some(parent),
+        ));
+        self.children.push(HashMap::new());
+        self.children[parent as usize].insert(name.to_owned(), identifier);
+        self.arena.dirs[parent as usize].child_dirs.push(identifier);
+        identifier
     }
 }
 
-trait OsLen {
-    fn as_os_len(&self) -> usize;
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl OsLen for Path {
-    fn as_os_len(&self) -> usize {
-        self.as_os_str().len()
+    #[test]
+    fn distinct_non_unicode_directory_names_keep_separate_file_ids() {
+        #[cfg(unix)]
+        let names = {
+            use std::os::unix::ffi::OsStringExt;
+            [
+                OsString::from_vec(vec![0xfe]),
+                OsString::from_vec(vec![0xff]),
+            ]
+        };
+        #[cfg(windows)]
+        let names = {
+            use std::os::windows::ffi::OsStringExt;
+            [
+                OsString::from_wide(&[0xd800]),
+                OsString::from_wide(&[0xd801]),
+            ]
+        };
+        let root = PathBuf::from("/native-path-fixture");
+        let paths = names
+            .iter()
+            .map(|name| root.join(name).join("file.txt"))
+            .collect();
+        let arena = IndexArena::from_paths(root, paths);
+        assert_eq!(arena.dirs[0].child_dirs.len(), 2);
+        assert_eq!(arena.dirs[1].file_ids, vec![0]);
+        assert_eq!(arena.dirs[2].file_ids, vec![1]);
+        assert_ne!(arena.files[0].native_path, arena.files[1].native_path);
     }
 }

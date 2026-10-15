@@ -1,258 +1,188 @@
-use crate::arena::{DirNode, FileEntry, IndexArena};
-use crate::index::{file_name_from_path, SearchIndex};
+use crate::arena::IndexArena;
 use redb::{Database, TableDefinition};
-use std::path::Path;
+use std::{
+    collections::HashSet,
+    io,
+    path::{Component, Path},
+};
 
-const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const INDEX_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("index");
-
-const MAGIC_V1: &[u8; 4] = b"CSH1";
-const MAGIC_V2: &[u8; 4] = b"CSH2";
-const MAGIC_V3: &[u8; 4] = b"CSH3";
+const MAGIC: &[u8; 4] = b"CSH4";
+const MAX_CACHE_BYTES: usize = 512 * 1024 * 1024;
 
 pub struct IndexStore {
-    db: Database,
+    database: Database,
 }
 
 impl IndexStore {
-    pub fn open(path: &Path) -> Result<Self, redb::Error> {
-        let db = Database::create(path).map_err(redb::Error::from)?;
-        Ok(Self { db })
+    pub fn open(path: &Path) -> io::Result<Self> {
+        Ok(Self {
+            database: Database::create(path).map_err(io::Error::other)?,
+        })
     }
 
-    pub fn save(&self, arena: &IndexArena) -> Result<(), redb::Error> {
-        let blob = serialize_arena(arena);
-        let write_txn = self.db.begin_write().map_err(redb::Error::from)?;
+    pub fn save(&self, arena: &IndexArena) -> io::Result<()> {
+        let blob = serialize_arena(arena)?;
+        let transaction = self.database.begin_write().map_err(io::Error::other)?;
         {
-            let mut meta = write_txn
-                .open_table(META_TABLE)
-                .map_err(redb::Error::from)?;
-            meta.insert("root", arena.root.to_string_lossy().as_bytes())
-                .map_err(redb::Error::from)?;
-            let mut index = write_txn
+            let mut table = transaction
                 .open_table(INDEX_TABLE)
-                .map_err(redb::Error::from)?;
-            index.insert("arena", blob.as_slice())
-                .map_err(redb::Error::from)?;
+                .map_err(io::Error::other)?;
+            table
+                .insert("arena", blob.as_slice())
+                .map_err(io::Error::other)?;
         }
-        write_txn.commit().map_err(redb::Error::from)?;
-        Ok(())
+        transaction.commit().map_err(io::Error::other)
     }
 
-    pub fn load(&self) -> Result<Option<IndexArena>, redb::Error> {
-        let read_txn = self.db.begin_read().map_err(redb::Error::from)?;
-        let index = match read_txn.open_table(INDEX_TABLE) {
-            Ok(t) => t,
+    pub fn load(&self) -> io::Result<Option<IndexArena>> {
+        let transaction = self.database.begin_read().map_err(io::Error::other)?;
+        let table = match transaction.open_table(INDEX_TABLE) {
+            Ok(table) => table,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
-            Err(e) => return Err(redb::Error::from(e)),
+            Err(error) => return Err(io::Error::other(error)),
         };
-
-        let Some(blob) = index
-            .get("arena")
-            .map_err(redb::Error::from)?
-            .map(|v| v.value().to_vec())
-        else {
+        let Some(value) = table.get("arena").map_err(io::Error::other)? else {
             return Ok(None);
         };
-
-        deserialize_arena(&blob).map(Some)
+        deserialize_arena(value.value()).map(Some)
     }
 }
 
-fn serialize_arena(arena: &IndexArena) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(MAGIC_V3);
-
-    write_str(&mut out, &arena.root.to_string_lossy());
-    out.extend_from_slice(&arena.global_midpoint.to_le_bytes());
-
-    write_u32(&mut out, arena.dirs.len() as u32);
-    for dir in &arena.dirs {
-        write_str(&mut out, &dir.name);
-        write_opt_u32(&mut out, dir.parent);
-        write_u32_slice(&mut out, &dir.child_dirs);
-        write_u32_slice(&mut out, &dir.file_ids);
-        out.extend_from_slice(&dir.subtree_min_len.to_le_bytes());
-        out.extend_from_slice(&dir.subtree_max_len.to_le_bytes());
-        out.extend_from_slice(&dir.file_count.to_le_bytes());
-    }
-
-    write_u32(&mut out, arena.files.len() as u32);
+/// Persist canonical source paths only: reconstruct graph IDs and Unicode grams on load.
+fn serialize_arena(arena: &IndexArena) -> io::Result<Vec<u8>> {
+    let mut output = MAGIC.to_vec();
+    write_path(&mut output, &arena.root)?;
+    let count = u32::try_from(arena.files.len()).map_err(|_| corrupt("too many cached paths"))?;
+    output.extend_from_slice(&count.to_le_bytes());
     for file in &arena.files {
-        write_str(&mut out, &file.path);
-        write_str(&mut out, &file.name_lower);
-        out.extend_from_slice(&file.name_len.to_le_bytes());
-    }
-
-    crate::index::serialize(&arena.search, &mut out);
-    out
-}
-
-fn deserialize_arena(data: &[u8]) -> Result<IndexArena, redb::Error> {
-    let mut cursor = 0usize;
-    let magic = read_bytes(data, &mut cursor, 4)?;
-    let v2 = magic == MAGIC_V2 || magic == MAGIC_V3;
-    let v3 = magic == MAGIC_V3;
-    if magic != MAGIC_V1 && !v2 {
-        return Err(redb::Error::from(redb::StorageError::Corrupted(
-            "invalid index magic".into(),
-        )));
-    }
-
-    let root = read_str(data, &mut cursor)?;
-    let global_midpoint = read_u16(data, &mut cursor)?;
-
-    let dir_count = read_u32(data, &mut cursor)? as usize;
-    let mut dirs = Vec::with_capacity(dir_count);
-    for _ in 0..dir_count {
-        let name = read_str(data, &mut cursor)?;
-        let parent = read_opt_u32(data, &mut cursor)?;
-        let child_dirs = read_u32_slice(data, &mut cursor)?;
-        let file_ids = read_u32_slice(data, &mut cursor)?;
-        let subtree_min_len = read_u16(data, &mut cursor)?;
-        let subtree_max_len = read_u16(data, &mut cursor)?;
-        let file_count = read_u32(data, &mut cursor)?;
-        dirs.push(DirNode {
-            name,
-            parent,
-            child_dirs,
-            file_ids,
-            subtree_min_len,
-            subtree_max_len,
-            file_count,
-        });
-    }
-
-    let file_count = read_u32(data, &mut cursor)? as usize;
-    let mut files = Vec::with_capacity(file_count);
-    for _ in 0..file_count {
-        let path = read_str(data, &mut cursor)?;
-        let (name_lower, name_len) = if v2 {
-            let name_lower = read_str(data, &mut cursor)?;
-            let name_len = read_u16(data, &mut cursor)?;
-            (name_lower, name_len)
-        } else {
-            let name_len = read_u16(data, &mut cursor)?;
-            let name_lower = file_name_from_path(&path);
-            (name_lower, name_len)
-        };
-        files.push(FileEntry {
-            path,
-            name_lower,
-            name_len,
-        });
-    }
-
-    let search = if v3 && cursor < data.len() {
-        crate::index::deserialize(data, &mut cursor).map_err(|e| {
-            redb::Error::from(redb::StorageError::Corrupted(e))
-        })?
-    } else {
-        SearchIndex::build_from_files(&files, global_midpoint)
-    };
-
-    if cursor != data.len() {
-        return Err(redb::Error::from(redb::StorageError::Corrupted(
-            "trailing index bytes".into(),
-        )));
-    }
-    Ok(IndexArena {
-        root: root.into(),
-        dirs,
-        files,
-        global_midpoint,
-        search,
-    })
-}
-
-fn write_u32(out: &mut Vec<u8>, value: u32) {
-    out.extend_from_slice(&value.to_le_bytes());
-}
-
-fn write_str(out: &mut Vec<u8>, s: &str) {
-    write_u32(out, s.len() as u32);
-    out.extend_from_slice(s.as_bytes());
-}
-
-fn write_opt_u32(out: &mut Vec<u8>, value: Option<u32>) {
-    match value {
-        Some(v) => {
-            out.push(1);
-            write_u32(out, v);
+        write_path(&mut output, &file.native_path)?;
+        if output.len() > MAX_CACHE_BYTES {
+            return Err(corrupt("cache exceeds size limit"));
         }
-        None => out.push(0),
     }
+    Ok(output)
 }
 
-fn write_u32_slice(out: &mut Vec<u8>, values: &[u32]) {
-    write_u32(out, values.len() as u32);
-    for &v in values {
-        write_u32(out, v);
+fn deserialize_arena(data: &[u8]) -> io::Result<IndexArena> {
+    if data.len() > MAX_CACHE_BYTES || data.get(..4) != Some(MAGIC) {
+        return Err(corrupt("unsupported or oversized cache; rebuild required"));
     }
+    let mut cursor = 4;
+    let root = read_path(data, &mut cursor)?;
+    let count = read_u32(data, &mut cursor)? as usize;
+    if count > data.len().saturating_sub(cursor) / 4 {
+        return Err(corrupt("invalid path count"));
+    }
+    let mut paths = Vec::new();
+    let mut seen = HashSet::new();
+    for _ in 0..count {
+        let path = read_path(data, &mut cursor)?;
+        let relative = path
+            .strip_prefix(&root)
+            .map_err(|_| corrupt("cached path outside root"))?;
+        if relative.as_os_str().is_empty()
+            || !relative
+                .components()
+                .all(|part| matches!(part, Component::Normal(_)))
+            || !seen.insert(path.clone())
+        {
+            return Err(corrupt("invalid or duplicate cached path"));
+        }
+        paths.push(path);
+    }
+    if cursor != data.len() {
+        return Err(corrupt("trailing cache bytes"));
+    }
+    Ok(IndexArena::from_paths(root, paths))
 }
 
-fn read_bytes<'a>(data: &'a [u8], cursor: &mut usize, len: usize) -> Result<&'a [u8], redb::Error> {
+fn write_path(output: &mut Vec<u8>, path: &Path) -> io::Result<()> {
+    // The cache is native-platform specific; UTF-16 on Windows and raw bytes on Unix.
+    #[cfg(windows)]
+    let encoded: Vec<u8> = {
+        use std::os::windows::ffi::OsStrExt;
+        path.as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect()
+    };
+    #[cfg(not(windows))]
+    let encoded: Vec<u8> = {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().to_vec()
+    };
+    let length = u32::try_from(encoded.len()).map_err(|_| corrupt("cached path too long"))?;
+    output.extend_from_slice(&length.to_le_bytes());
+    output.extend_from_slice(&encoded);
+    Ok(())
+}
+
+fn read_path(data: &[u8], cursor: &mut usize) -> io::Result<std::path::PathBuf> {
+    let length = read_u32(data, cursor)? as usize;
     let end = cursor
-        .checked_add(len)
-        .ok_or_else(|| redb::Error::from(redb::StorageError::Corrupted("index overflow".into())))?;
-    if end > data.len() {
-        return Err(redb::Error::from(redb::StorageError::Corrupted(
-            "unexpected end of index".into(),
-        )));
-    }
-    let slice = &data[*cursor..end];
+        .checked_add(length)
+        .ok_or_else(|| corrupt("path offset overflow"))?;
+    let bytes = data
+        .get(*cursor..end)
+        .ok_or_else(|| corrupt("truncated path"))?;
     *cursor = end;
-    Ok(slice)
-}
-
-fn read_u32(data: &[u8], cursor: &mut usize) -> Result<u32, redb::Error> {
-    let bytes = read_bytes(data, cursor, 4)?;
-    Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
-}
-
-fn read_u16(data: &[u8], cursor: &mut usize) -> Result<u16, redb::Error> {
-    let bytes = read_bytes(data, cursor, 2)?;
-    Ok(u16::from_le_bytes(bytes.try_into().unwrap()))
-}
-
-fn read_str(data: &[u8], cursor: &mut usize) -> Result<String, redb::Error> {
-    let len = read_u32(data, cursor)? as usize;
-    let bytes = read_bytes(data, cursor, len)?;
-    String::from_utf8(bytes.to_vec()).map_err(|e| {
-        redb::Error::from(redb::StorageError::Corrupted(format!(
-            "invalid utf8 in index: {e}"
-        )))
-    })
-}
-
-fn read_opt_u32(data: &[u8], cursor: &mut usize) -> Result<Option<u32>, redb::Error> {
-    let tag = *read_bytes(data, cursor, 1)?.first().unwrap();
-    match tag {
-        0 => Ok(None),
-        1 => Ok(Some(read_u32(data, cursor)?)),
-        _ => Err(redb::Error::from(redb::StorageError::Corrupted(
-            "invalid optional u32 tag".into(),
-        ))),
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStringExt;
+        if bytes.len() % 2 != 0 {
+            return Err(corrupt("invalid UTF-16 path"));
+        }
+        let units: Vec<_> = bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        Ok(std::ffi::OsString::from_wide(&units).into())
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        Ok(std::ffi::OsString::from_vec(bytes.to_vec()).into())
     }
 }
 
-fn read_u32_slice(data: &[u8], cursor: &mut usize) -> Result<Vec<u32>, redb::Error> {
-    let len = read_u32(data, cursor)? as usize;
-    let byte_len = len * 4;
+fn read_u32(data: &[u8], cursor: &mut usize) -> io::Result<u32> {
     let end = cursor
-        .checked_add(byte_len)
-        .ok_or_else(|| redb::Error::from(redb::StorageError::Corrupted("index overflow".into())))?;
-    if end > data.len() {
-        return Err(redb::Error::from(redb::StorageError::Corrupted(
-            "unexpected end of index".into(),
-        )));
-    }
-    let slice = &data[*cursor..end];
+        .checked_add(4)
+        .ok_or_else(|| corrupt("cache offset overflow"))?;
+    let bytes = data
+        .get(*cursor..end)
+        .ok_or_else(|| corrupt("truncated cache"))?;
     *cursor = end;
+    Ok(u32::from_le_bytes(
+        bytes.try_into().expect("four-byte range"),
+    ))
+}
 
-    let mut out = Vec::with_capacity(len);
-    for chunk in slice.chunks_exact(4) {
-        out.push(u32::from_le_bytes(chunk.try_into().unwrap()));
+fn corrupt(message: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn malformed_caches_fail_without_unbounded_allocations_or_panics() {
+        for bytes in [vec![], b"CSH3".to_vec(), b"CSH4\xff\xff\xff\xff".to_vec()] {
+            assert!(deserialize_arena(&bytes).is_err());
+        }
     }
-    Ok(out)
+
+    #[test]
+    fn path_cache_roundtrip_reconstructs_consistent_ids_and_unicode_names() {
+        let root = std::path::PathBuf::from("/source");
+        let arena = IndexArena::from_paths(
+            root.clone(),
+            vec![root.join("a/CAFÉ.txt"), root.join("b/other.rs")],
+        );
+        let restored = deserialize_arena(&serialize_arena(&arena).unwrap()).unwrap();
+        assert_eq!(restored.files[0].name_lower, "café.txt");
+        assert_eq!(restored.dirs[1].file_ids, vec![0]);
+    }
 }

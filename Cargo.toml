@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 authors = ["Robert"]
 publish = false
+license = "Apache-2.0"
 
 [lib]
 name = "codesearch"
@@ -19,7 +20,6 @@ path = "src/bin/bench.rs"
 
 [dependencies]
 ignore = "0.4"
-jwalk = "0.8"
 redb = "2"
 notify = { version = "6", default-features = false, features = ["macos_fsevent", "crossbeam-channel"] }
 rayon = "1"

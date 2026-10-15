@@ -1,5 +1,7 @@
 # Rust
 target/
+benchmarks/compare/artifacts/
+benchmarks/compare/fixtures/
 
 # Local databases
 .codesearch-*.redb

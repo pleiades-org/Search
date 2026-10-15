@@ -1,0 +1,12 @@
+{
+  "date_utc": "2026-10-06T16:22:40.9245398Z",
+  "baseline_revision": "fb1d7969450357955e23c344912c7856478716db",
+  "compiler": "rustc 1.95.0 (59807616e 2026-04-14)",
+  "os": "Microsoft Windows NT 10.0.26200.0",
+  "logical_processors": 16,
+  "runs": 3,
+  "build": "release defaults; default features disabled; same harness source and pinned library versions",
+  "before_sha256": "C53A08699763198FF4EB9778E5B0FFBC4A5BE3890A70CA5764E996DD56F7B307",
+  "after_sha256": "401FCF3E8D5158BB45C26E39EFC1A272E512AE6A404FD91B4402479131E69EA2",
+  "caveats": "Warm OS caches; no affinity/isolation; medians of run medians and run p95s; 10ms observed working-set peaks are lower bounds; first12 order changed from scheduling-dependent to source order."
+}
